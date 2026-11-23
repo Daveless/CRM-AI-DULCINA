@@ -1,11 +1,13 @@
 import { useState } from "react";
 import KanbanBoard from "./components/KanbanBoard";
 import ChatView from "./components/ChatView";
+import OrdersBoard from "./components/OrdersBoard";
+import ConfigView from "./components/ConfigView";
 
-type Tab = "kanban" | "chats";
+type Tab = "funnel" | "chats" | "orders" | "config";
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("kanban");
+  const [tab, setTab] = useState<Tab>("funnel");
   const [selectedConversation, setSelectedConversation] = useState<string | null>(null);
 
   return (
@@ -13,16 +15,22 @@ export default function App() {
       <header style={{ padding: "10px 16px", borderBottom: "1px solid #e2e8f0", display: "flex", gap: 16, alignItems: "center" }}>
         <strong>💐 Dulcina — Panel de operador</strong>
         <nav style={{ display: "flex", gap: 8 }}>
-          <TabButton active={tab === "kanban"} onClick={() => setTab("kanban")}>
-            Kanban
+          <TabButton active={tab === "funnel"} onClick={() => setTab("funnel")}>
+            Embudo
           </TabButton>
           <TabButton active={tab === "chats"} onClick={() => setTab("chats")}>
             Chats
           </TabButton>
+          <TabButton active={tab === "orders"} onClick={() => setTab("orders")}>
+            Pedidos
+          </TabButton>
+          <TabButton active={tab === "config"} onClick={() => setTab("config")}>
+            Configuración
+          </TabButton>
         </nav>
       </header>
       <main style={{ flex: 1, overflow: "hidden" }}>
-        {tab === "kanban" ? (
+        {tab === "funnel" && (
           <div style={{ height: "100%", overflowY: "auto" }}>
             <KanbanBoard
               onOpenChat={(id) => {
@@ -31,9 +39,10 @@ export default function App() {
               }}
             />
           </div>
-        ) : (
-          <ChatView selectedId={selectedConversation} onSelect={setSelectedConversation} />
         )}
+        {tab === "chats" && <ChatView selectedId={selectedConversation} onSelect={setSelectedConversation} />}
+        {tab === "orders" && <OrdersBoard />}
+        {tab === "config" && <ConfigView />}
       </main>
     </div>
   );

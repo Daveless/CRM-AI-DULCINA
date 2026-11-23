@@ -13,9 +13,12 @@ import {
   parseWebhook,
 } from "../_shared/whatsapp-gateway.ts";
 import { serviceClient } from "../_shared/supabase-client.ts";
-import { runOrchestrator } from "../_shared/orchestrator.ts";
+import { runOrchestrator, ESCALATION_TEMPLATES } from "../_shared/orchestrator.ts";
+import { applyKeywordSafetyNet, detectarTercero, escalar } from "../_shared/tools.ts";
 
 const supabase = serviceClient();
+
+const TERCERO_TEMPLATE = "Gracias por su mensaje. Una persona de nuestro equipo le escribirá por aquí en un momento.";
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -118,6 +121,32 @@ async function handleInboundMessage(msg: any) {
     return;
   }
 
+  // TERCERO (sección 2.1): si quien escribe es el receptor de un pedido
+  // ajeno y no el comprador, se decide en código, nunca se le pasa al LLM.
+  // No revela nada, solo pausa y escala.
+  if (msg.type === "text") {
+    const esTercero = await detectarTercero(msg.fromWaId, customer.id);
+    if (esTercero) {
+      await escalar(conversation.id, "TERCERO", "ALTA", "Mensaje de un receptor que no es el comprador.", msg.text ?? "", undefined, undefined, "regla");
+      const { waMessageId } = await sendText(msg.fromWaId, TERCERO_TEMPLATE);
+      await supabase.from("messages").insert({
+        conversation_id: conversation.id,
+        wa_message_id: waMessageId ?? null,
+        direction: "out",
+        sender_type: "bot",
+        msg_type: "text",
+        body: TERCERO_TEMPLATE,
+      });
+      return;
+    }
+
+    // Filtro determinístico previo (sección 7.2, paso 6): la red de
+    // seguridad por palabras clave corre ANTES del LLM. Si acaba de pausar
+    // el chat, este mensaje no se le pasa al modelo.
+    const recienPausado = await applyKeywordSafetyNet(conversation.id, msg.text ?? "");
+    if (recienPausado) return;
+  }
+
   const isMediaMessage = msg.type === "image" || msg.type === "document";
   const history = await buildHistory(conversation.id);
 
@@ -150,7 +179,7 @@ async function handleInboundMessage(msg: any) {
     if (escalationError) console.error("escalation_insert_failed", escalationError);
 
     try {
-      await sendText(msg.fromWaId, "Recibimos su mensaje. Nuestro equipo lo revisará y le responderá por aquí en un momento.");
+      await sendText(msg.fromWaId, ESCALATION_TEMPLATES.DUDA_NO_RESUELTA);
     } catch (sendErr) {
       console.error("fixed_message_send_failed", sendErr);
     }

@@ -111,16 +111,19 @@ export async function escalar(
   summary: string,
   customerText: string,
   confidence?: number,
+  orderId?: string,
+  detectedBy: "llm" | "regla" | "sistema" = "llm",
 ) {
   const { error } = await supabase.from("escalations").upsert(
     {
       conversation_id: conversationId,
+      order_id: orderId ?? null,
       reason,
       priority,
       summary,
       customer_text: customerText,
       confidence,
-      detected_by: "llm",
+      detected_by: detectedBy,
     },
     { onConflict: "conversation_id,reason", ignoreDuplicates: true },
   );
@@ -130,4 +133,115 @@ export async function escalar(
     .from("conversations")
     .update({ mode: "humano", paused_at: new Date().toISOString(), pause_reason: reason })
     .eq("id", conversationId);
+}
+
+const PRIORITY_RANK: Record<string, number> = { NORMAL: 0, MEDIA: 1, ALTA: 2, CRITICA: 3 };
+
+// Red de seguridad por palabras clave (sección 5.2, punto 1): corre SIEMPRE
+// sobre el texto crudo del cliente, en código, antes o en paralelo al LLM.
+// Solo puede SUBIR el nivel de alerta, nunca bajarlo ni reemplazar la razón
+// que ya detectó el modelo con una de menor prioridad.
+const KEYWORD_RULES: { pattern: RegExp; reason: string; priority: string }[] = [
+  { pattern: /no (me )?ha llegado|no llega(ndo)?\b|ya es tarde|pas[oó] la hora|d[oó]nde est[aá] (el repartidor|mi pedido)/i, reason: "RETRASO", priority: "ALTA" },
+  { pattern: /ese no es mi pedido|se equivocaron|no es para m[ií]|paquete no es para m[ií]|frase incorrecta/i, reason: "ERROR_PEDIDO", priority: "CRITICA" },
+  { pattern: /entreg[oó] a otra persona|no responde el (repartidor|tel[eé]fono)|no encuentra la (casa|direcci[oó]n)/i, reason: "PROBLEMA_ENTREGA", priority: "CRITICA" },
+  { pattern: /cancelar|devoluci[oó]n|reembolso|quiero mi dinero|cambiar mi pedido/i, reason: "REEMBOLSO_CANCELACION", priority: "ALTA" },
+  { pattern: /\b(feo|da[ñn]ado|mal estado|p[eé]sim[oa]|terrible|horrible|est[aá]fa|incompetentes|idiotas)\b/i, reason: "RECLAMO_CALIDAD", priority: "ALTA" },
+];
+
+export interface KeywordMatch {
+  reason: string;
+  priority: string;
+}
+
+export function keywordSafetyNet(text: string): KeywordMatch | null {
+  for (const rule of KEYWORD_RULES) {
+    if (rule.pattern.test(text)) return { reason: rule.reason, priority: rule.priority };
+  }
+  return null;
+}
+
+// Aplica la red de seguridad: si hay match y no existe ya una escalación con
+// esa razón, la crea; si existe con prioridad menor, la sube. Nunca la baja.
+// Devuelve true si esta llamada ACABA de pausar el chat (escalación nueva),
+// para que el webhook sepa que no debe llamar al LLM con este mensaje.
+export async function applyKeywordSafetyNet(conversationId: string, customerText: string): Promise<boolean> {
+  const match = keywordSafetyNet(customerText);
+  if (!match) return false;
+
+  const { data: existing } = await supabase
+    .from("escalations")
+    .select("id, priority")
+    .eq("conversation_id", conversationId)
+    .eq("reason", match.reason)
+    .maybeSingle();
+
+  if (!existing) {
+    await escalar(conversationId, match.reason, match.priority, "Detectado por palabra clave.", customerText, undefined, undefined, "regla");
+    return true;
+  }
+
+  if (PRIORITY_RANK[match.priority] > PRIORITY_RANK[existing.priority]) {
+    await supabase.from("escalations").update({ priority: match.priority }).eq("id", existing.id);
+  }
+  return false;
+}
+
+// Decide RETRASO vs. CONSULTA_ESTADO comparando con delivery_deadline, en
+// código (sección 5.2, punto 2) — nunca lo decide el modelo.
+export async function consultarEstadoPedido(conversationId: string, orderCode: string) {
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, status, delivery_deadline, delivery_date")
+    .eq("order_code", orderCode)
+    .maybeSingle();
+  if (error) throw error;
+  if (!order) return { found: false as const };
+
+  const now = Date.now();
+  const deadline = order.delivery_deadline ? new Date(order.delivery_deadline).getTime() : null;
+  const isDelivered = order.status === "entregado";
+  const isLate = deadline !== null && !isDelivered && now >= deadline - 15 * 60 * 1000;
+
+  if (isLate) {
+    const lateMinutes = Math.round((now - (deadline as number)) / 60000);
+    await escalar(
+      conversationId,
+      "RETRASO",
+      "ALTA",
+      `Pedido ${orderCode}: hora comprometida vencida o a menos de 15 min. Diferencia: ${lateMinutes} min.`,
+      "",
+      undefined,
+      order.id,
+      "regla",
+    );
+    return { found: true as const, status: order.status, lateMinutes, escalationReason: "RETRASO" as const };
+  }
+
+  return { found: true as const, status: order.status, deliveryDeadline: order.delivery_deadline };
+}
+
+// Detección de TERCERO (sección 2.1): un número que coincide con el teléfono
+// de un receptor con pedido activo, pero no es el comprador de ningún pedido
+// propio. Se decide en código, antes de llamar al LLM — nunca se le pide al
+// modelo que juzgue si debe revelar datos de un pedido ajeno.
+export async function detectarTercero(waId: string, customerId: string | null): Promise<boolean> {
+  const phoneE164 = waId.startsWith("+") ? waId : `+${waId}`;
+  const { data: recipient } = await supabase
+    .from("recipients")
+    .select("id")
+    .eq("phone_e164", phoneE164)
+    .maybeSingle();
+  if (!recipient) return false;
+
+  const { data: orderAsRecipient } = await supabase
+    .from("orders")
+    .select("id, customer_id")
+    .eq("recipient_id", recipient.id)
+    .limit(1)
+    .maybeSingle();
+  if (!orderAsRecipient) return false;
+
+  // Es tercero si el pedido donde aparece como receptor no es suyo como comprador.
+  return orderAsRecipient.customer_id !== customerId;
 }

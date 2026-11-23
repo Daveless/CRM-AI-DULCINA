@@ -1,12 +1,15 @@
-# Dulcina Bot — prototipo (Fases A-D)
+# Dulcina Bot — prototipo (Fases A-D + ciclo de vida del pedido)
 
-Implementación inicial del manual operativo "Dulcina Bot v2.1": bienvenida,
+Implementación del manual operativo "Dulcina Bot v2.1": bienvenida,
 catálogo/sugerencias, hora + sector (regla de 3 horas), abono del 50% y
-registro del pedido como `pendiente_confirmacion`, más un panel de operador
-(Kanban + chat) construido sobre esa base. **No incluye** las Fases E-G
-(detalles de la etapa 2, entrega y saldo), la sincronización real con
-WooCommerce ni la matriz completa de escalamiento — eso queda para las
-siguientes fases del plan (ver sección 11.2 del manual).
+registro del pedido; matriz de escalamiento (plantillas fijas, red de
+seguridad por palabras clave, TERCERO, RETRASO vs. consulta de estado); y el
+ciclo de vida completo del pedido operado desde el panel (confirmar,
+rechazar, marcar en ruta/entregado, verificar pagos). **No incluye** la
+recolección conversacional de la Fase F (receptor/dirección/tarjeta vía
+WhatsApp — en este prototipo esos datos se completan manualmente desde el
+panel si hace falta), plantillas de WhatsApp aprobadas por Meta, ni
+autenticación en el panel (a propósito, mientras se sigue desarrollando).
 
 ## Stack
 
@@ -38,13 +41,35 @@ siguientes fases del plan (ver sección 11.2 del manual).
   `reset_funnel_for_new_deal()`, para reabrir el embudo con un cliente que
   vuelve a comprar después de cerrar un pedido anterior — es una función
   explícita, no algo que el bot o un UPDATE cualquiera puedan disparar solos.
-- **Panel de operador** (`panel/`, Vite + React + TS): tablero Kanban por
-  `funnel_stage` con drag-and-drop (mueve conversaciones vía Supabase Realtime;
-  si se intenta retroceder, la base de datos lo rechaza y el panel muestra el
-  error), vista de chat (lista + hilo + composer) y el switch "Tomar control" /
-  "Reanudar bot". El envío real de WhatsApp pasa por la Edge Function
-  `operator-send` (`supabase/functions/operator-send/`), nunca por el
-  navegador directamente — así el token de Meta no se expone al cliente.
+- **Panel de operador** (`panel/`, Vite + React + TS), 4 pestañas:
+  - **Embudo**: Kanban por `funnel_stage` con drag-and-drop (la base de
+    datos rechaza los retrocesos y el panel muestra el error).
+  - **Chats**: lista + hilo + composer, switch "Tomar control" / "Reanudar
+    bot". El envío real pasa por la Edge Function `operator-send`, nunca
+    por el navegador directamente.
+  - **Pedidos**: Kanban por `orders.status` (agrupación de solo lectura;
+    los cambios de estado pasan por botones de acción, no por arrastrar,
+    porque confirmar exige pago verificado). Incluye "Crear pedido" manual
+    y, por pedido, verificar/registrar pagos, confirmar, rechazar, marcar
+    arreglo elaborado, en ruta y entregado. Todo pasa por la Edge Function
+    `order-actions` (`supabase/functions/order-actions/`), que además
+    envía la notificación real por WhatsApp con plantillas fijas.
+  - **Configuración**: datos operativos editables (cuenta bancaria del
+    abono/saldo, reglas de negocio clave) y el manual de atención como
+    referencia de solo lectura (`panel/src/data/manual.md`).
+- **Matriz de escalamiento** (`supabase/functions/_shared/tools.ts` +
+  `orchestrator.ts`): mensajes de escalamiento siempre por **plantilla
+  fija** (nunca texto libre del modelo), red de seguridad por palabras
+  clave que solo puede subir la prioridad nunca bajarla, `TERCERO`
+  detectado en código antes de invocar al LLM, y `consultar_estado_pedido`
+  que decide en código si es `RETRASO` o una simple consulta de estado.
+- **Ciclo de vida del pedido** (`supabase/migrations/20261123000004_order_lifecycle.sql`
+  + `order-actions`): mismo truco que el embudo — el orden de declaración
+  del enum `order_status` bloquea retrocesos, y un trigger exige
+  `payment_status` en `abonado_50`/`pagado_100` antes de permitir
+  `confirmado`. Otro trigger recalcula `payment_status` automáticamente
+  cuando se verifica un pago, y cierra el pedido (`closed_at`) al llegar a
+  `pagado_100` con el pedido ya entregado.
 
 ## Requisitos
 
@@ -168,3 +193,117 @@ la app de Meta, con el mismo `WHATSAPP_VERIFY_TOKEN`.
 - Las `occasions` de los productos vienen de las **categorías reales** de
   WooCommerce (slugificadas), no de una convención de tags `ocasion-X` —
   esa convención del manual no existe en el sitio real.
+- La Fase F (receptor, dirección, tarjeta, facturación) no se recolecta
+  por conversación con el bot — el orquestador sigue restringido a
+  Fases A-D. Un pedido manual creado desde el panel, o uno que el bot
+  registró, se completa y avanza con los botones de "Pedidos"; los datos
+  de receptor/dirección quedarían pendientes de agregar a mano si se
+  necesitan (no hay formulario para editarlos todavía).
+- Probado en vivo (Edge Functions reales, no solo SQL): el trigger de
+  confirmación bloqueado sin pago, `verify_payment` → `abonado_50` →
+  `confirm` (avanza embudo a `confirmado`, notifica por WhatsApp real) →
+  `mark_entregado` (avanza a `ganado`) → `register_payment` del saldo →
+  cierre automático en `pagado_100`. También `create_manual` (pedido
+  tomado por teléfono) con cómputo correcto de totales y validación de
+  zona.
+
+## Pasos para levantar la infraestructura real (producción)
+
+Hoy todo corre en Docker local + un túnel de `cloudflared` que muere si
+cierras la terminal. Para que esto sobreviva sin tu laptop prendida:
+
+1. **Crear el proyecto real en Supabase**
+   - supabase.com/dashboard → "New Project". Elige una región (idealmente
+     cercana a Ecuador, ej. `us-east-1`).
+   - Guarda la contraseña de la base de datos que te pida generar.
+
+2. **Vincular este repo al proyecto**
+   ```bash
+   npx supabase login
+   npx supabase link --project-ref <tu-project-ref>
+   ```
+
+3. **Subir el esquema**
+   ```bash
+   npx supabase db push
+   ```
+   Esto aplica todas las migraciones de `supabase/migrations/` al proyecto
+   real, en orden. Revisa que termine sin errores antes de seguir.
+
+4. **Configurar los secretos de las Edge Functions** (nunca van en el
+   repo, van directo al proyecto)
+   ```bash
+   npx supabase secrets set \
+     WHATSAPP_VERIFY_TOKEN=... \
+     WHATSAPP_ACCESS_TOKEN=... \
+     WHATSAPP_PHONE_NUMBER_ID=... \
+     META_APP_SECRET=... \
+     GEMINI_API_KEY=... \
+     GEMINI_MODEL=gemini-3.6-flash \
+     WOOCOMMERCE_SITE_URL=https://dulcinachocolates.com \
+     WOOCOMERCE_CONSUMIDOR=... \
+     WOOCOMERCE_SECRET=...
+   ```
+
+5. **Token de Meta permanente** (no el de 24h que hemos regenerado varias
+   veces en esta sesión): Business Settings → Usuarios → Usuarios del
+   sistema → crear uno → Generar token con `whatsapp_business_messaging` +
+   `whatsapp_business_management`, asignado a la app. Úsalo en el secreto
+   `WHATSAPP_ACCESS_TOKEN` del paso 4.
+
+6. **Desplegar las Edge Functions**
+   ```bash
+   npx supabase functions deploy whatsapp-webhook --no-verify-jwt
+   npx supabase functions deploy operator-send --no-verify-jwt
+   npx supabase functions deploy order-actions --no-verify-jwt
+   npx supabase functions deploy catalog-sync --no-verify-jwt
+   ```
+   `--no-verify-jwt` porque Meta no manda un JWT de Supabase, y el panel
+   todavía no tiene autenticación (revisar esto cuando se agregue).
+
+7. **Apuntar el webhook de Meta a la URL real**
+   - Nueva URL: `https://<project-ref>.supabase.co/functions/v1/whatsapp-webhook`
+   - App Dashboard → WhatsApp → Configuración → Webhooks → Edit → pegar la
+     URL + el mismo `WHATSAPP_VERIFY_TOKEN`.
+   - Re-suscribir el campo `messages` (el mismo problema que ya depuramos
+     hoy: la URL puede quedar verificada pero sin ningún campo suscrito).
+     Lo más confiable es repetir la llamada que ya usamos:
+     ```bash
+     curl -X POST "https://graph.facebook.com/v25.0/<APP_ID>/subscriptions" \
+       --data-urlencode "object=whatsapp_business_account" \
+       --data-urlencode "callback_url=https://<project-ref>.supabase.co/functions/v1/whatsapp-webhook" \
+       --data-urlencode "verify_token=<WHATSAPP_VERIFY_TOKEN>" \
+       --data-urlencode "fields=messages" \
+       --data-urlencode "access_token=<APP_ID>|<META_APP_SECRET>"
+     ```
+
+8. **Programar `catalog-sync` con pg_cron** (en local no se pudo por la
+   red de Docker; en el proyecto real sí hay ruta limpia):
+   ```sql
+   select cron.schedule(
+     'catalog-sync-daily',
+     '10 0 * * *', -- 05:00 Ecuador = 10:00 UTC
+     $$
+       select net.http_post(
+         url := 'https://<project-ref>.supabase.co/functions/v1/catalog-sync',
+         headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.service_role_key'))
+       );
+     $$
+   );
+   ```
+   (Requiere las extensiones `pg_cron` y `pg_net`, activables desde
+   Database → Extensions en el dashboard.)
+
+9. **Desplegar el panel** — hoy solo corre en tu `localhost:5173`.
+   Cualquier hosting estático sirve (Vercel, Netlify, Cloudflare Pages):
+   ```bash
+   cd panel
+   # cambiar panel/.env.local a la URL y anon key del proyecto real
+   npm run build
+   # subir el contenido de panel/dist/
+   ```
+
+10. **Pendiente antes de un piloto con clientes reales**: autenticación
+    del panel (Supabase Auth + RLS) — a propósito fuera de alcance por
+    ahora — y las plantillas de WhatsApp aprobadas por Meta para mensajes
+    fuera de la ventana de 24h (saldo, foto de entrega).
