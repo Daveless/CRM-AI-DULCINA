@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.*.local
+.env.functions.test
+supabase/.temp/
+*.log
+graphify-out/
